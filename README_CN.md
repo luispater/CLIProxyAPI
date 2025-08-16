@@ -1,5 +1,7 @@
 # CLI 代理 API
 
+[![Mentioned in Awesome Gemini CLI](https://awesome.re/mentioned-badge.svg)](https://github.com/Piebald-AI/awesome-gemini-cli)
+
 [English](README.md) | 中文
 
 一个为 CLI 提供 OpenAI/Gemini/Claude 兼容 API 接口的代理服务器。

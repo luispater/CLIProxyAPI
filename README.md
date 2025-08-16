@@ -1,5 +1,7 @@
 # CLI Proxy API
 
+[![Mentioned in Awesome Gemini CLI](https://awesome.re/mentioned-badge.svg)](https://github.com/Piebald-AI/awesome-gemini-cli)
+
 English | [中文](README_CN.md)
 
 A proxy server that provides OpenAI/Gemini/Claude compatible API interfaces for CLI. 
