@@ -95,7 +95,8 @@ func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
     _ = client.loadConvStore()
 
     client.InitializeModelRegistry(clientID)
-    client.registerGeminiWebModels()
+    client.RegisterModels(GEMINI, getGeminiWebAliasedModels())
+
     client.gwc = gemweb.NewGeminiClient(ts.Secure1PSID, ts.Secure1PSIDTS, cfg.ProxyURL)
     if err := client.gwc.Init(300, false, 300, true, 540, false); err != nil {
         log.Warnf("Gemini Web init failed for %s: %v. Will retry in background.", client.GetEmail(), err)
@@ -127,7 +128,10 @@ func (c *GeminiWebClient) Provider() string {
 }
 
 func (c *GeminiWebClient) CanProvideModel(modelName string) bool {
-    return util.InArray([]string{"gemini-web-2.5-pro", "gemini-web-2.5-flash"}, modelName)
+    // Use centralized alias map for consistency
+    ensureGeminiWebAliasMap()
+    _, ok := geminiWebAliasMap[strings.ToLower(modelName)]
+    return ok
 }
 
 func (c *GeminiWebClient) GetEmail() string {
@@ -489,51 +493,63 @@ func (c *GeminiWebClient) RefreshTokens(ctx context.Context) error {
     return c.Init()
 }
 
-// registerGeminiAppModels registers uniquely named models for the Gemini App client
-// to avoid being included in the general Gemini round-robin pool.
-func (c *GeminiWebClient) registerGeminiWebModels() {
-    models := []*registry.ModelInfo{
-        {
-            ID:          "gemini-web-2.5-flash",
-            Object:      "model",
-            Created:     time.Now().Unix(),
-            OwnedBy:     "google",
-            Type:        GEMINI,
-            Name:        "gemini-web-2.5-flash",
-            Version:     "2.5",
-            Description: "Stable version of Gemini 2.5 Flash, our mid-size multimodal model that supports up to 1 million tokens, released in June of 2025.",
-            InputTokenLimit: 1048576,
-            OutputTokenLimit: 65536,
-            SupportedParameters: []string{"tools", "vision", "thinking"},
-        },
-        {
-            ID:          "gemini-web-2.5-pro",
-            Object:      "model",
-            Created:     time.Now().Unix(),
-            OwnedBy:     "google",
-            Type:        GEMINI,
-            Name:        "gemini-web-2.5-pro",
-            Version:     "2.5",
-            Description: "Stable release (June 17th, 2025) of Gemini 2.5 Pro",
-            InputTokenLimit: 1048576,
-            OutputTokenLimit: 65536,
-            SupportedParameters: []string{"tools", "vision", "thinking"},
-        },
+
+// mapAliasToUnderlying converts our public alias model names to geminiwebapi model names.
+// Centralized alias helpers to keep registration and lookup in sync
+var (
+    geminiWebAliasOnce sync.Once
+    geminiWebAliasMap  map[string]string // alias (lower) -> underlying (lower)
+)
+
+func ensureGeminiWebAliasMap() {
+    geminiWebAliasOnce.Do(func() {
+        geminiWebAliasMap = make(map[string]string)
+        for _, m := range registry.GetGeminiModels() {
+            // Skip models that the web client should not expose
+            if m.ID == "gemini-2.5-flash-lite" {
+                continue
+            }
+            alias := aliasFromModelID(m.ID)
+            geminiWebAliasMap[strings.ToLower(alias)] = strings.ToLower(m.ID)
+        }
+    })
+}
+
+func getGeminiWebAliasedModels() []*registry.ModelInfo {
+    ensureGeminiWebAliasMap()
+    aliased := make([]*registry.ModelInfo, 0)
+    for _, m := range registry.GetGeminiModels() {
+        if m.ID == "gemini-2.5-flash-lite" {
+            continue
+        }
+        cpy := *m
+        cpy.ID = aliasFromModelID(m.ID)
+        cpy.Name = cpy.ID
+        aliased = append(aliased, &cpy)
     }
-    c.RegisterModels(GEMINI, models)
+    return aliased
 }
 
 // mapAliasToUnderlying converts our public alias model names to geminiwebapi model names.
 func mapAliasToUnderlying(name string) string {
-    switch strings.ToLower(name) {
-    case "gemini-web-2.5-pro":
-        return "gemini-2.5-pro"
-    case "gemini-web-2.5-flash":
-        return "gemini-2.5-flash"
-    default:
-        // If user passes original names, pass through for compatibility
-        return name
+    ensureGeminiWebAliasMap()
+    n := strings.ToLower(name)
+    if u, ok := geminiWebAliasMap[n]; ok {
+        return u
     }
+    // Fallback: trim prefix if present, else passthrough
+    const prefix = "gemini-web-"
+    if strings.HasPrefix(n, prefix) {
+        // Rebuild the underlying name with the standard provider prefix
+        return "gemini-" + strings.TrimPrefix(n, prefix)
+    }
+    return name
+}
+
+// aliasFromModelID builds the public alias name we expose for a Gemini model ID.
+// Example: "gemini-2.5-pro" -> "gemini-web-2.5-pro"
+func aliasFromModelID(modelID string) string {
+    return "gemini-web-" + strings.TrimPrefix(modelID, "gemini-")
 }
 
 // ---------- Persistence of conversation metadata ----------
