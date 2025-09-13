@@ -276,6 +276,7 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
     if upErr != nil {
         return nil, upErr
     }
+    useMsgs = appendXMLWrapHintIfNeeded(useMsgs)
     explicitContext := true
     prompt := buildPrompt(useMsgs, tagged, false)
     if strings.TrimSpace(prompt) == "" {
@@ -439,6 +440,7 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
             errChan <- upErr
             return
         }
+        useMsgs = appendXMLWrapHintIfNeeded(useMsgs)
         explicitContext := true
         prompt := buildPrompt(useMsgs, tagged, false)
         if strings.TrimSpace(prompt) == "" {
@@ -1025,6 +1027,21 @@ func sanitizeAssistantMessages(msgs []roleText) []roleText {
         } else {
             out = append(out, m)
         }
+    }
+    return out
+}
+
+// XML wrap-hint injection for messages containing XML-like tags
+func appendXMLWrapHintIfNeeded(msgs []roleText) []roleText {
+    const hint = "\nFor any xml block, e.g. tool call, always wrap it with: \n`````xml\n...\n`````\n"
+    re := regexp.MustCompile(`(?s)<\s*[^>]+>`)
+    out := make([]roleText, 0, len(msgs))
+    for _, m := range msgs {
+        t := m.Text
+        if re.MatchString(t) {
+            t = t + hint
+        }
+        out = append(out, roleText{Role: m.Role, Text: t})
     }
     return out
 }
