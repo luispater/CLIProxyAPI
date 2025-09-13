@@ -141,7 +141,20 @@ func StartService(cfg *config.Config, configPath string) {
 					cliClients[path] = qwenClient
 					successfulAuthCount++
 				}
-			}
+            } else if tokenType == "gemini-web" {
+                var ts gemini.GeminiAppTokenStorage
+                if err = json.Unmarshal(data, &ts); err == nil {
+                    log.Info("Initializing gemini web authentication for token...")
+                    geminiWebClient, errClient := client.NewGeminiWebClient(cfg, &ts, path)
+                    if errClient != nil {
+                        log.Errorf("failed to create gemini web client for token %s: %v", path, errClient)
+                        return errClient
+                    }
+                    log.Info("Authentication successful.")
+                    cliClients[path] = geminiWebClient
+                    successfulAuthCount++
+                }
+            }
 		}
 		return nil
 	})

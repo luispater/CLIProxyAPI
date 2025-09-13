@@ -368,7 +368,12 @@ func (w *Watcher) createClientFromFile(path string, cfg *config.Config) (interfa
 		if err = json.Unmarshal(data, &ts); err == nil {
 			return client.NewQwenClient(cfg, &ts), nil
 		}
-	}
+    } else if tokenType == "gemini-web" {
+        var ts gemini.GeminiAppTokenStorage
+        if err = json.Unmarshal(data, &ts); err == nil {
+            return client.NewGeminiWebClient(cfg, &ts, path)
+        }
+    }
 
 	return nil, err
 }
