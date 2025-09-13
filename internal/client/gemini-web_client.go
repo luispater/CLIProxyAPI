@@ -17,6 +17,7 @@ import (
     "strings"
     "sync"
     "time"
+    "unicode/utf8"
 
     "github.com/gin-gonic/gin"
     gemweb "github.com/luispater/CLIProxyAPI/internal/api/geminiwebapi"
@@ -33,6 +34,8 @@ import (
 
 const (
 	geminiAppUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	continuationHint   = "\n(More messages to come, please reply with just 'ok.')"
+	maxCharsPerRequest = 800000
 )
 
 var (
@@ -289,7 +292,7 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
 
     log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
     var output *gemweb.ModelOutput
-    if out, genErr := chat.SendMessage(prompt, uploadedFiles); genErr != nil {
+    if out, genErr := c.sendWithSplit(chat, prompt, uploadedFiles); genErr != nil {
         log.Errorf("failed to generate content: %v", genErr)
         status := 500
         switch {
@@ -452,7 +455,7 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
 
         log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
         chat := c.gwc.StartChat(model, nil, meta)
-        out, genErr := chat.SendMessage(prompt, uploadedFiles)
+        out, genErr := c.sendWithSplit(chat, prompt, uploadedFiles)
         if genErr != nil {
             status := 500
             switch {
@@ -522,9 +525,24 @@ func chunkByRunes(s string, size int) []string {
 	}
 	return chunks
 }
+func (c *GeminiWebClient) sendWithSplit(chat *gemweb.ChatSession, text string, files []string) (gemweb.ModelOutput, error) {
+    if utf8.RuneCountInString(text) <= maxCharsPerRequest {
+        return chat.SendMessage(text, files)
+    }
+    size := maxCharsPerRequest - utf8.RuneCountInString(continuationHint)
+    if size <= 0 {
+        size = maxCharsPerRequest
+    }
+    chunks := chunkByRunes(text, size)
+    for i := 0; i < len(chunks)-1; i++ {
+        chk := chunks[i] + continuationHint
+        if _, err := chat.SendMessage(chk, nil); err != nil {
+            return gemweb.ModelOutput{}, err
+        }
+    }
+    return chat.SendMessage(chunks[len(chunks)-1], files)
+}
 
-// appendUpstreamRequestLog appends a compact, rune-safe preview of the request context
-// into the Gin context's API_REQUEST key so the upstream logger can capture it.
 func (c *GeminiWebClient) appendUpstreamRequestLog(ctx context.Context, modelName string, useTags, explicitContext bool, prompt string, filesCount int, reuse bool, metaLen int) {
     if !c.cfg.RequestLog { return }
     ginContext, ok := ctx.Value("gin").(*gin.Context)
