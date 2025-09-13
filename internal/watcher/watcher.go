@@ -222,6 +222,9 @@ func (w *Watcher) reloadConfig() bool {
 		if oldConfig.RequestRetry != newConfig.RequestRetry {
 			log.Debugf("  request-retry: %d -> %d", oldConfig.RequestRetry, newConfig.RequestRetry)
 		}
+		if oldConfig.GeminiWebContext != newConfig.GeminiWebContext {
+			log.Debugf("  gemini-web-context: %s -> %s", oldConfig.GeminiWebContext, newConfig.GeminiWebContext)
+		}
 		if len(oldConfig.APIKeys) != len(newConfig.APIKeys) {
 			log.Debugf("  api-keys count: %d -> %d", len(oldConfig.APIKeys), len(newConfig.APIKeys))
 		}

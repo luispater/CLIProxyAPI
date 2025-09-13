@@ -53,8 +53,14 @@ type Config struct {
 	// AllowLocalhostUnauthenticated allows unauthenticated requests from localhost.
 	AllowLocalhostUnauthenticated bool `yaml:"allow-localhost-unauthenticated" json:"allow-localhost-unauthenticated"`
 
-	// RemoteManagement nests management-related options under 'remote-management'.
-	RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
+    // RemoteManagement nests management-related options under 'remote-management'.
+    RemoteManagement RemoteManagement `yaml:"remote-management" json:"-"`
+
+    // GeminiWebContext selects the session context strategy for Gemini Web clients.
+    // Accepted values:
+    //   - "reuse": enable JSON-based reusable conversation matching
+    //   - "account": use account-level metadata only (no conversation reuse) [default]
+    GeminiWebContext string `yaml:"gemini-web-context" json:"gemini-web-context"`
 }
 
 // RemoteManagement holds management API configuration under 'remote-management'.

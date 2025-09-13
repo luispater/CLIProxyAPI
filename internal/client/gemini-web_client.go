@@ -166,6 +166,20 @@ func (c *GeminiWebClient) StableClientID() string {
     return "gemini-web-" + sum
 }
 
+// useReusableContext reports whether JSON-based reusable conversation matching is enabled.
+// Default is account-level context (no reuse). Set `gemini-web-context: reuse` to enable.
+func (c *GeminiWebClient) useReusableContext() bool {
+    mode := strings.ToLower(strings.TrimSpace(c.cfg.GeminiWebContext))
+    switch mode {
+    case "reuse", "reusable", "on", "true", "enabled":
+        return true
+    case "account", "legacy", "off", "false", "disabled", "":
+        fallthrough
+    default:
+        return false
+    }
+}
+
 func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
     originalRequestRawJSON := bytes.Clone(rawJSON)
 
@@ -194,49 +208,69 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
         return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err}
     }
 
-    // Find a reusable session (longest reusable prefix; last must be assistant/system)
-    reuseMeta, remaining := c.findReusableSession(underlying, cleaned)
-    reuse := len(reuseMeta) > 0
-    var meta []string
-    var useMsgs []roleText
-    if reuse {
-        meta = reuseMeta
-        if len(remaining) == 1 {
-            useMsgs = []roleText{remaining[0]}
-        } else {
-            useMsgs = remaining
-        }
-    } else {
-        // Start a fresh session without reusing account-level metadata
-        meta = nil
-        useMsgs = cleaned
-    }
+    var (
+        meta        []string
+        useMsgs     []roleText
+        tagged      bool
+        filesSubset [][]byte
+        mimesSubset []string
+        reuse       bool
+        metaLen     int
+    )
 
-    tagged := needRoleTags(useMsgs)
-    if reuse && len(remaining) == 1 {
-        tagged = false
-    }
-    var filesSubset [][]byte
-    var mimesSubset []string
-    if reuse && len(remaining) == 1 && len(messages) > 0 {
-        // only files from the last message
-        lastIdx := len(messages) - 1
-        if lastIdx >= 0 && lastIdx < len(msgFileIdx) {
-            for _, fi := range msgFileIdx[lastIdx] {
-                if fi >= 0 && fi < len(files) {
-                    filesSubset = append(filesSubset, files[fi])
-                    // mime indices align with files slice
-                    if fi < len(mimes) {
-                        mimesSubset = append(mimesSubset, mimes[fi])
-                    } else {
-                        mimesSubset = append(mimesSubset, "")
+    if c.useReusableContext() {
+        // Find a reusable session (longest reusable prefix; last must be assistant/system)
+        reuseMeta, remaining := c.findReusableSession(underlying, cleaned)
+        reuse = len(reuseMeta) > 0
+        if reuse {
+            meta = reuseMeta
+            if len(remaining) == 1 {
+                useMsgs = []roleText{remaining[0]}
+            } else {
+                useMsgs = remaining
+            }
+        } else {
+            // Start a fresh session without reusing account-level metadata
+            meta = nil
+            useMsgs = cleaned
+        }
+
+        tagged = needRoleTags(useMsgs)
+        if reuse && len(useMsgs) == 1 {
+            // When reusing and sending only the tail user message, omit tags
+            tagged = false
+        }
+
+        if reuse && len(useMsgs) == 1 && len(messages) > 0 {
+            // only files from the last message
+            lastIdx := len(messages) - 1
+            if lastIdx >= 0 && lastIdx < len(msgFileIdx) {
+                for _, fi := range msgFileIdx[lastIdx] {
+                    if fi >= 0 && fi < len(files) {
+                        filesSubset = append(filesSubset, files[fi])
+                        // mime indices align with files slice
+                        if fi < len(mimes) {
+                            mimesSubset = append(mimesSubset, mimes[fi])
+                        } else {
+                            mimesSubset = append(mimesSubset, "")
+                        }
                     }
                 }
             }
+        } else {
+            filesSubset = files
+            mimesSubset = mimes
         }
+        metaLen = len(meta)
     } else {
+        // Legacy: explicit full-context prompt + account-level metadata only
+        meta = c.getAccountMetadata(modelName)
+        useMsgs = cleaned
+        tagged = needRoleTags(useMsgs)
         filesSubset = files
         mimesSubset = mimes
+        reuse = false
+        metaLen = len(meta)
     }
     uploadedFiles, upErr := c.materializeInlineFiles(filesSubset, mimesSubset)
     if upErr != nil {
@@ -248,7 +282,7 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
         return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: empty prompt after filtering system/thought content")}
     }
 
-    c.appendUpstreamRequestLog(ctx, modelName, tagged, explicitContext, prompt, len(uploadedFiles), reuse, len(meta))
+    c.appendUpstreamRequestLog(ctx, modelName, tagged, explicitContext, prompt, len(uploadedFiles), reuse, metaLen)
 
     chat := c.gwc.StartChat(model, nil, meta)
 
@@ -289,11 +323,10 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
             // Keep storing for conversation records; not used to seed new sessions
             c.setAccountMetadata(modelName, metaAfter)
         }
-    }
-
-    // On success, persist the conversation (strip assistant thought tags) for future reusable-session lookup
-    if output != nil {
-        c.storeConversationJSON(underlying, cleaned, chat.Metadata(), output)
+        // Persist conversation only when reusable context is enabled
+        if c.useReusableContext() {
+            c.storeConversationJSON(underlying, cleaned, chat.Metadata(), output)
+        }
     }
 
     if translator.NeedConvert(handlerType, c.Type()) {
@@ -343,45 +376,63 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         model, err := gemweb.ModelFromName(underlying)
         if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
 
-        reuseMeta, remaining := c.findReusableSession(underlying, cleaned)
-        reuse := len(reuseMeta) > 0
-        var meta []string
-        var useMsgs []roleText
-        if reuse {
-            meta = reuseMeta
-            if len(remaining) == 1 {
-                useMsgs = []roleText{remaining[0]}
-            } else {
-                useMsgs = remaining
-            }
-        } else {
-            meta = nil
-            useMsgs = cleaned
-        }
+        var (
+            meta        []string
+            useMsgs     []roleText
+            tagged      bool
+            filesSubset [][]byte
+            mimesSubset []string
+            reuse       bool
+            metaLen     int
+        )
 
-        tagged := needRoleTags(useMsgs)
-        if reuse && len(remaining) == 1 {
-            tagged = false
-        }
-        var filesSubset [][]byte
-        var mimesSubset []string
-        if reuse && len(remaining) == 1 && len(messages) > 0 {
-            lastIdx := len(messages) - 1
-            if lastIdx >= 0 && lastIdx < len(msgFileIdx) {
-                for _, fi := range msgFileIdx[lastIdx] {
-                    if fi >= 0 && fi < len(files) {
-                        filesSubset = append(filesSubset, files[fi])
-                        if fi < len(mimes) {
-                            mimesSubset = append(mimesSubset, mimes[fi])
-                        } else {
-                            mimesSubset = append(mimesSubset, "")
+        if c.useReusableContext() {
+            reuseMeta, remaining := c.findReusableSession(underlying, cleaned)
+            reuse = len(reuseMeta) > 0
+            if reuse {
+                meta = reuseMeta
+                if len(remaining) == 1 {
+                    useMsgs = []roleText{remaining[0]}
+                } else {
+                    useMsgs = remaining
+                }
+            } else {
+                meta = nil
+                useMsgs = cleaned
+            }
+
+            tagged = needRoleTags(useMsgs)
+            if reuse && len(useMsgs) == 1 {
+                tagged = false
+            }
+            if reuse && len(useMsgs) == 1 && len(messages) > 0 {
+                lastIdx := len(messages) - 1
+                if lastIdx >= 0 && lastIdx < len(msgFileIdx) {
+                    for _, fi := range msgFileIdx[lastIdx] {
+                        if fi >= 0 && fi < len(files) {
+                            filesSubset = append(filesSubset, files[fi])
+                            if fi < len(mimes) {
+                                mimesSubset = append(mimesSubset, mimes[fi])
+                            } else {
+                                mimesSubset = append(mimesSubset, "")
+                            }
                         }
                     }
                 }
+            } else {
+                filesSubset = files
+                mimesSubset = mimes
             }
+            metaLen = len(meta)
         } else {
+            // Legacy behavior
+            meta = c.getAccountMetadata(modelName)
+            useMsgs = cleaned
+            tagged = needRoleTags(useMsgs)
             filesSubset = files
             mimesSubset = mimes
+            reuse = false
+            metaLen = len(meta)
         }
         uploadedFiles, upErr := c.materializeInlineFiles(filesSubset, mimesSubset)
         if upErr != nil {
@@ -395,7 +446,7 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
             return
         }
 
-        c.appendUpstreamRequestLog(ctx, modelName, tagged, explicitContext, prompt, len(uploadedFiles), reuse, len(meta))
+        c.appendUpstreamRequestLog(ctx, modelName, tagged, explicitContext, prompt, len(uploadedFiles), reuse, metaLen)
 
         log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
         chat := c.gwc.StartChat(model, nil, meta)
@@ -427,8 +478,10 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         metaAfter := chat.Metadata()
         if len(metaAfter) > 0 { c.setAccountMetadata(modelName, metaAfter) }
 
-        // On success, persist the conversation (strip assistant thought tags) for future reusable-session lookup
-        c.storeConversationJSON(underlying, cleaned, chat.Metadata(), &out)
+        // Persist conversation only when reusable context is enabled
+        if c.useReusableContext() {
+            c.storeConversationJSON(underlying, cleaned, chat.Metadata(), &out)
+        }
 
         if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
             var param any
@@ -478,6 +531,7 @@ func (c *GeminiWebClient) appendUpstreamRequestLog(ctx context.Context, modelNam
     var sb strings.Builder
     sb.WriteString("\n\n=== GEMINI WEB UPSTREAM ===\n")
     sb.WriteString(fmt.Sprintf("account: %s\n", c.GetEmail()))
+    if c.useReusableContext() { sb.WriteString("context_mode: on\n") } else { sb.WriteString("context_mode: off\n") }
     if reuse { sb.WriteString("reuseIdx: 1\n") } else { sb.WriteString("reuseIdx: 0\n") }
     sb.WriteString(fmt.Sprintf("useTags: %t\n", useTags))
     sb.WriteString(fmt.Sprintf("metadata_len: %d\n", metaLen))
