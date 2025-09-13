@@ -3,7 +3,9 @@
 import (
     "bytes"
     "context"
+    "crypto/sha256"
     "encoding/base64"
+    "encoding/hex"
     "encoding/json"
     "errors"
     "fmt"
@@ -53,8 +55,15 @@ type GeminiWebClient struct {
     ClientBase
     gwc           *gemweb.GeminiClient
     tokenFilePath string
-    convStore map[string][]string
-    convMutex sync.RWMutex
+    convStore     map[string][]string
+    convMutex     sync.RWMutex
+
+    // JSON-based conversation persistence
+    convData  map[string]conversationRecord
+    convIndex map[string]string
+
+    // restart-stable id for conversation hashing/lookup
+    stableClientID string
 
     cookieRotationStarted bool
     cookiePersistCancel   context.CancelFunc
@@ -76,10 +85,12 @@ func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
     jar, _ := cookiejar.New(nil)
     httpClient := util.SetProxy(cfg, &http.Client{Jar: jar})
 
-	idPrefix := ts.Secure1PSID
-	if len(idPrefix) > 8 {
-		idPrefix = idPrefix[:8]
-	}
+    // derive a restart-stable id from tokens (sha256 of 1PSID, hex prefix)
+    stableSuffix := sha256Hex(ts.Secure1PSID)
+    if len(stableSuffix) > 16 { stableSuffix = stableSuffix[:16] }
+    // runtime registry id (not used for hashing)
+    idPrefix := stableSuffix
+    if len(idPrefix) > 8 { idPrefix = idPrefix[:8] }
     clientID := fmt.Sprintf("gemini-web-%s-%d", idPrefix, time.Now().UnixNano())
     client := &GeminiWebClient{
         ClientBase: ClientBase{
@@ -91,8 +102,12 @@ func NewGeminiWebClient(cfg *config.Config, ts *gemini.GeminiAppTokenStorage, to
         },
         tokenFilePath: tokenFilePath,
         convStore:     make(map[string][]string),
+        convData:      make(map[string]conversationRecord),
+        convIndex:     make(map[string]string),
+        stableClientID: "gemini-web-" + stableSuffix,
     }
     _ = client.loadConvStore()
+    _ = client.loadConvData()
 
     client.InitializeModelRegistry(clientID)
     client.RegisterModels(GEMINI, getGeminiWebAliasedModels())
@@ -139,54 +154,102 @@ func (c *GeminiWebClient) GetEmail() string {
     return strings.TrimSuffix(base, ".json")
 }
 
+// StableClientID returns an ID that remains stable across restarts,
+// used for conversation hashing and lookup.
+func (c *GeminiWebClient) StableClientID() string {
+    if c.stableClientID != "" {
+        return c.stableClientID
+    }
+    // Fallback: derive from token file name to avoid empty value
+    sum := sha256Hex(c.GetEmail())
+    if len(sum) > 16 { sum = sum[:16] }
+    return "gemini-web-" + sum
+}
+
 func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, rawJSON []byte, alt string) ([]byte, *interfaces.ErrorMessage) {
-    // Keep a pristine copy for translator context
     originalRequestRawJSON := bytes.Clone(rawJSON)
 
-	// Normalize request into Gemini-style JSON if coming from another handler
-	var handlerType string
-	if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
-		handlerType = handler.HandlerType()
-		rawJSON = translator.Request(handlerType, c.Type(), modelName, rawJSON, false)
-	}
+    var handlerType string
+    if handler, ok := ctx.Value("handler").(interfaces.APIHandler); ok {
+        handlerType = handler.HandlerType()
+        rawJSON = translator.Request(handlerType, c.Type(), modelName, rawJSON, false)
+    }
 
-	// Log upstream API request body for request logger
-	if c.cfg.RequestLog {
-		if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
-			ginContext.Set("API_REQUEST", rawJSON)
-		}
-	}
+    if c.cfg.RequestLog {
+        if ginContext, ok := ctx.Value("gin").(*gin.Context); ok {
+            ginContext.Set("API_REQUEST", rawJSON)
+        }
+    }
 
-    // Parse messages and inline files (if any)
-    // - Exclude system prompts from context
-    // - Exclude any thought/reasoning parts from context
-    messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
+    messages, files, mimes, msgFileIdx, err := c.parseMessagesAndFiles(rawJSON)
     if err != nil {
         return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
     }
-    // Write inline files to temp and use file paths for web API client
-    uploadedFiles, upErr := c.materializeInlineFiles(files, mimes)
+
+    cleaned := sanitizeAssistantMessages(messages)
+
+    underlying := mapAliasToUnderlying(modelName)
+    model, err := gemweb.ModelFromName(underlying)
+    if err != nil {
+        return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err}
+    }
+
+    // Find a reusable session (longest reusable prefix; last must be assistant/system)
+    reuseMeta, remaining := c.findReusableSession(underlying, cleaned)
+    reuse := len(reuseMeta) > 0
+    var meta []string
+    var useMsgs []roleText
+    if reuse {
+        meta = reuseMeta
+        if len(remaining) == 1 {
+            useMsgs = []roleText{remaining[0]}
+        } else {
+            useMsgs = remaining
+        }
+    } else {
+        // Start a fresh session without reusing account-level metadata
+        meta = nil
+        useMsgs = cleaned
+    }
+
+    tagged := needRoleTags(useMsgs)
+    if reuse && len(remaining) == 1 {
+        tagged = false
+    }
+    var filesSubset [][]byte
+    var mimesSubset []string
+    if reuse && len(remaining) == 1 && len(messages) > 0 {
+        // only files from the last message
+        lastIdx := len(messages) - 1
+        if lastIdx >= 0 && lastIdx < len(msgFileIdx) {
+            for _, fi := range msgFileIdx[lastIdx] {
+                if fi >= 0 && fi < len(files) {
+                    filesSubset = append(filesSubset, files[fi])
+                    // mime indices align with files slice
+                    if fi < len(mimes) {
+                        mimesSubset = append(mimesSubset, mimes[fi])
+                    } else {
+                        mimesSubset = append(mimesSubset, "")
+                    }
+                }
+            }
+        }
+    } else {
+        filesSubset = files
+        mimesSubset = mimes
+    }
+    uploadedFiles, upErr := c.materializeInlineFiles(filesSubset, mimesSubset)
     if upErr != nil {
         return nil, upErr
     }
-
-    // Build explicit-context prompt (no system, no thoughts), not relying on built-in multi-turn history
-    cleaned := sanitizeAssistantMessages(messages)
-    useTags := needRoleTags(cleaned)
     explicitContext := true
-    prompt := buildPrompt(cleaned, useTags, false)
+    prompt := buildPrompt(useMsgs, tagged, false)
     if strings.TrimSpace(prompt) == "" {
         return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: empty prompt after filtering system/thought content")}
     }
 
-    // For request logging: append upstream prompt/decision details into API_REQUEST
-    c.appendUpstreamRequestLog(ctx, modelName, useTags, explicitContext, prompt, len(uploadedFiles))
+    c.appendUpstreamRequestLog(ctx, modelName, tagged, explicitContext, prompt, len(uploadedFiles), reuse, len(meta))
 
-    // Always StartChat per request, but reuse the same account-level metadata
-    underlying := mapAliasToUnderlying(modelName)
-    model, err := gemweb.ModelFromName(underlying)
-    if err != nil { return nil, &interfaces.ErrorMessage{StatusCode: 400, Error: err} }
-    meta := c.getAccountMetadata(modelName)
     chat := c.gwc.StartChat(model, nil, meta)
 
     log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
@@ -201,27 +264,36 @@ func (c *GeminiWebClient) SendRawMessage(ctx context.Context, modelName string, 
             status = 400
         }
         if status == 429 {
-            now := time.Now(); c.modelQuotaExceeded[modelName] = &now; c.SetModelQuotaExceeded(modelName)
+            now := time.Now()
+            c.modelQuotaExceeded[modelName] = &now
+            c.SetModelQuotaExceeded(modelName)
         }
         return nil, &interfaces.ErrorMessage{StatusCode: status, Error: genErr}
-    } else { output = &out }
+    } else {
+        output = &out
+    }
 
-    // Clear quota status on success
     delete(c.modelQuotaExceeded, modelName)
     c.ClearModelQuotaExceeded(modelName)
 
-    // Convert to Gemini API-style JSON, then translate if needed for handler
     gemBytes, errMsg := c.convertOutputToGemini(output, modelName)
     if errMsg != nil {
         return nil, errMsg
     }
 
-    // Log the constructed upstream-like response for request logger
     c.AddAPIResponseData(ctx, gemBytes)
 
-    // Update the reusable account-level metadata after a successful reply
-    if output != nil && len(output.Metadata) > 0 {
-        c.setAccountMetadata(modelName, output.Metadata)
+    if output != nil {
+        metaAfter := chat.Metadata()
+        if len(metaAfter) > 0 {
+            // Keep storing for conversation records; not used to seed new sessions
+            c.setAccountMetadata(modelName, metaAfter)
+        }
+    }
+
+    // On success, persist the conversation (strip assistant thought tags) for future reusable-session lookup
+    if output != nil {
+        c.storeConversationJSON(underlying, cleaned, chat.Metadata(), output)
     }
 
     if translator.NeedConvert(handlerType, c.Type()) {
@@ -259,36 +331,73 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
 
         // Build messages and upload inline files if any
         // - Exclude system prompts and thought/reasoning parts from context
-        messages, files, mimes, err := c.parseMessagesAndFiles(rawJSON)
+        messages, files, mimes, msgFileIdx, err := c.parseMessagesAndFiles(rawJSON)
         if err != nil {
             errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: fmt.Errorf("bad request: %w", err)}
             return
         }
-        uploadedFiles, upErr := c.materializeInlineFiles(files, mimes)
+
+        cleaned := sanitizeAssistantMessages(messages)
+
+        underlying := mapAliasToUnderlying(modelName)
+        model, err := gemweb.ModelFromName(underlying)
+        if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
+
+        reuseMeta, remaining := c.findReusableSession(underlying, cleaned)
+        reuse := len(reuseMeta) > 0
+        var meta []string
+        var useMsgs []roleText
+        if reuse {
+            meta = reuseMeta
+            if len(remaining) == 1 {
+                useMsgs = []roleText{remaining[0]}
+            } else {
+                useMsgs = remaining
+            }
+        } else {
+            meta = nil
+            useMsgs = cleaned
+        }
+
+        tagged := needRoleTags(useMsgs)
+        if reuse && len(remaining) == 1 {
+            tagged = false
+        }
+        var filesSubset [][]byte
+        var mimesSubset []string
+        if reuse && len(remaining) == 1 && len(messages) > 0 {
+            lastIdx := len(messages) - 1
+            if lastIdx >= 0 && lastIdx < len(msgFileIdx) {
+                for _, fi := range msgFileIdx[lastIdx] {
+                    if fi >= 0 && fi < len(files) {
+                        filesSubset = append(filesSubset, files[fi])
+                        if fi < len(mimes) {
+                            mimesSubset = append(mimesSubset, mimes[fi])
+                        } else {
+                            mimesSubset = append(mimesSubset, "")
+                        }
+                    }
+                }
+            }
+        } else {
+            filesSubset = files
+            mimesSubset = mimes
+        }
+        uploadedFiles, upErr := c.materializeInlineFiles(filesSubset, mimesSubset)
         if upErr != nil {
             errChan <- upErr
             return
         }
-
-        cleaned := sanitizeAssistantMessages(messages)
-        // Build explicit-context prompt (no system, no thoughts)
         explicitContext := true
-        useTags := needRoleTags(cleaned)
-        prompt := buildPrompt(cleaned, useTags, false)
+        prompt := buildPrompt(useMsgs, tagged, false)
         if strings.TrimSpace(prompt) == "" {
             errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: errors.New("bad request: empty prompt after filtering system/thought content")}
             return
         }
 
-        // For request logging: append upstream prompt/decision details into API_REQUEST (streaming)
-        c.appendUpstreamRequestLog(ctx, modelName, useTags, explicitContext, prompt, len(uploadedFiles))
+        c.appendUpstreamRequestLog(ctx, modelName, tagged, explicitContext, prompt, len(uploadedFiles), reuse, len(meta))
 
         log.Debugf("Use Gemini Web account %s for model %s", c.GetEmail(), modelName)
-        // Always StartChat per request, but reuse the same account-level metadata
-        underlying := mapAliasToUnderlying(modelName)
-        model, err := gemweb.ModelFromName(underlying)
-        if err != nil { errChan <- &interfaces.ErrorMessage{StatusCode: 400, Error: err}; return }
-        meta := c.getAccountMetadata(modelName)
         chat := c.gwc.StartChat(model, nil, meta)
         out, genErr := chat.SendMessage(prompt, uploadedFiles)
         if genErr != nil {
@@ -312,12 +421,15 @@ func (c *GeminiWebClient) SendRawMessageStream(ctx context.Context, modelName st
         delete(c.modelQuotaExceeded, modelName)
         c.ClearModelQuotaExceeded(modelName)
 
-        // Build one final Gemini-shaped response and stream it as a single event
         gemBytes, errMsg := c.convertOutputToGemini(&out, modelName)
         if errMsg != nil { errChan <- errMsg; return }
         c.AddAPIResponseData(ctx, gemBytes)
-        // Update the reusable account-level metadata after a successful reply
-        if len(out.Metadata) > 0 { c.setAccountMetadata(modelName, out.Metadata) }
+        metaAfter := chat.Metadata()
+        if len(metaAfter) > 0 { c.setAccountMetadata(modelName, metaAfter) }
+
+        // On success, persist the conversation (strip assistant thought tags) for future reusable-session lookup
+        c.storeConversationJSON(underlying, cleaned, chat.Metadata(), &out)
+
         if translator.NeedConvert(handlerType, c.Type()) && handlerType != GEMINI {
             var param any
             lines := translator.Response(handlerType, c.Type(), ctx, modelName, originalRequestRawJSON, rawJSON, gemBytes, &param)
@@ -358,7 +470,7 @@ func chunkByRunes(s string, size int) []string {
 
 // appendUpstreamRequestLog appends a compact, rune-safe preview of the request context
 // into the Gin context's API_REQUEST key so the upstream logger can capture it.
-func (c *GeminiWebClient) appendUpstreamRequestLog(ctx context.Context, modelName string, useTags, explicitContext bool, prompt string, filesCount int) {
+func (c *GeminiWebClient) appendUpstreamRequestLog(ctx context.Context, modelName string, useTags, explicitContext bool, prompt string, filesCount int, reuse bool, metaLen int) {
     if !c.cfg.RequestLog { return }
     ginContext, ok := ctx.Value("gin").(*gin.Context)
     if !ok || ginContext == nil { return }
@@ -366,10 +478,9 @@ func (c *GeminiWebClient) appendUpstreamRequestLog(ctx context.Context, modelNam
     var sb strings.Builder
     sb.WriteString("\n\n=== GEMINI WEB UPSTREAM ===\n")
     sb.WriteString(fmt.Sprintf("account: %s\n", c.GetEmail()))
-    // Always StartChat per request; reuse account-level metadata; explicit context embedded in prompt
-    sb.WriteString("reuseIdx: 0\n")
+    if reuse { sb.WriteString("reuseIdx: 1\n") } else { sb.WriteString("reuseIdx: 0\n") }
     sb.WriteString(fmt.Sprintf("useTags: %t\n", useTags))
-    sb.WriteString(fmt.Sprintf("metadata_len: %d\n", len(c.getAccountMetadata(modelName))))
+    sb.WriteString(fmt.Sprintf("metadata_len: %d\n", metaLen))
     if explicitContext { sb.WriteString("explicit_context: true\n") } else { sb.WriteString("explicit_context: false\n") }
     if filesCount > 0 { sb.WriteString(fmt.Sprintf("files: %d\n", filesCount)) }
 
@@ -554,7 +665,6 @@ func aliasFromModelID(modelID string) string {
 
 // ---------- Persistence of conversation metadata ----------
 func (c *GeminiWebClient) convStorePath() string {
-    // Store conversations under <program-working-dir>/conv/
     wd, err := os.Getwd()
     if err != nil || wd == "" {
         wd = "."
@@ -562,6 +672,17 @@ func (c *GeminiWebClient) convStorePath() string {
     convDir := filepath.Join(wd, "conv")
     base := strings.TrimSuffix(filepath.Base(c.tokenFilePath), filepath.Ext(c.tokenFilePath))
     return filepath.Join(convDir, base+".conv.json")
+}
+
+// JSON conversation data file (separate from account metadata)
+func (c *GeminiWebClient) convDataPath() string {
+    wd, err := os.Getwd()
+    if err != nil || wd == "" {
+        wd = "."
+    }
+    convDir := filepath.Join(wd, "conv")
+    base := strings.TrimSuffix(filepath.Base(c.tokenFilePath), filepath.Ext(c.tokenFilePath))
+    return filepath.Join(convDir, base+".data.json")
 }
 
 func (c *GeminiWebClient) loadConvStore() error {
@@ -614,6 +735,49 @@ func (c *GeminiWebClient) setAccountMetadata(modelName string, metadata []string
     _ = c.saveConvStore()
 }
 
+
+func (c *GeminiWebClient) loadConvData() error {
+    path := c.convDataPath()
+    b, err := os.ReadFile(path)
+    if err != nil {
+        return nil
+    }
+    var wrapper struct {
+        Items map[string]conversationRecord `json:"items"`
+        Index map[string]string             `json:"index"`
+    }
+    if err := json.Unmarshal(b, &wrapper); err != nil {
+        return err
+    }
+    c.convMutex.Lock()
+    if wrapper.Items != nil {
+        c.convData = wrapper.Items
+    }
+    if wrapper.Index != nil {
+        c.convIndex = wrapper.Index
+    }
+    c.convMutex.Unlock()
+    return nil
+}
+
+func (c *GeminiWebClient) saveConvData() error {
+    path := c.convDataPath()
+    wrapper := struct {
+        Items map[string]conversationRecord `json:"items"`
+        Index map[string]string             `json:"index"`
+    }{
+        Items: c.convData,
+        Index: c.convIndex,
+    }
+    c.convMutex.RLock()
+    data, err := json.MarshalIndent(wrapper, "", "  ")
+    c.convMutex.RUnlock()
+    if err != nil { return err }
+    tmp := path + ".tmp"
+    if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { return err }
+    if err := os.WriteFile(tmp, data, 0o644); err != nil { return err }
+    return os.Rename(tmp, path)
+}
 
 func (c *GeminiWebClient) backgroundInitRetry() {
     backoffs := []time.Duration{5 * time.Second, 10 * time.Second, 30 * time.Second, 1 * time.Minute, 2 * time.Minute, 5 * time.Minute}
@@ -687,10 +851,11 @@ type roleText struct {
     Text string
 }
 
-func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][]byte, []string, error) {
+func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][]byte, []string, [][]int, error) {
     var messages []roleText
     var files [][]byte
     var mimes []string
+    var perMsgFileIdx [][]int
 
     contents := gjson.GetBytes(rawJSON, "contents")
     if contents.Exists() {
@@ -701,6 +866,7 @@ func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][
                 return true
             }
             var b strings.Builder
+            startFile := len(files)
             content.Get("parts").ForEach(func(_, part gjson.Result) bool {
                 if text := part.Get("text"); text.Exists() {
                     // Skip thought/reasoning parts from context
@@ -729,10 +895,19 @@ func (c *GeminiWebClient) parseMessagesAndFiles(rawJSON []byte) ([]roleText, [][
                 return true
             })
             messages = append(messages, roleText{Role: role, Text: b.String()})
+            // record indices of files added by this message
+            endFile := len(files)
+            if endFile > startFile {
+                idxs := make([]int, 0, endFile-startFile)
+                for i := startFile; i < endFile; i++ { idxs = append(idxs, i) }
+                perMsgFileIdx = append(perMsgFileIdx, idxs)
+            } else {
+                perMsgFileIdx = append(perMsgFileIdx, nil)
+            }
             return true
         })
     }
-    return messages, files, mimes, nil
+    return messages, files, mimes, perMsgFileIdx, nil
 }
 
 func needRoleTags(msgs []roleText) bool {
@@ -798,6 +973,157 @@ func sanitizeAssistantMessages(msgs []roleText) []roleText {
         }
     }
     return out
+}
+
+// ========== JSON conversation storage: structs/hashing/lookup/persistence (aligned with prior LMDB-style logic) ==========
+
+type storedMessage struct {
+    Role    string `json:"role"`
+    Content string `json:"content"`
+    Name    string `json:"name,omitempty"`
+}
+
+type conversationRecord struct {
+    Model     string          `json:"model"`
+    ClientID  string          `json:"client_id"`
+    Metadata  []string        `json:"metadata,omitempty"`
+    Messages  []storedMessage `json:"messages"`
+    CreatedAt time.Time       `json:"created_at"`
+    UpdatedAt time.Time       `json:"updated_at"`
+}
+
+func (c *GeminiWebClient) toStoredMessages(msgs []roleText) []storedMessage {
+    out := make([]storedMessage, 0, len(msgs))
+    for _, m := range msgs {
+        out = append(out, storedMessage{
+            Role:    m.Role,
+            Content: m.Text,
+        })
+    }
+    return out
+}
+
+func (c *GeminiWebClient) hashMessage(m storedMessage) string {
+    s := fmt.Sprintf(`{"content":%q,"role":%q}`, m.Content, strings.ToLower(m.Role))
+    return sha256Hex(s)
+}
+
+func (c *GeminiWebClient) hashConversation(clientID, model string, msgs []storedMessage) string {
+    var b strings.Builder
+    b.WriteString(clientID)
+    b.WriteString("|")
+    b.WriteString(model)
+    for _, m := range msgs {
+        b.WriteString("|")
+        b.WriteString(c.hashMessage(m))
+    }
+    return sha256Hex(b.String())
+}
+
+func (c *GeminiWebClient) findByMessageList(model string, msgs []roleText) (conversationRecord, bool) {
+    stored := c.toStoredMessages(msgs)
+    stableID := c.StableClientID()
+    stableHash := c.hashConversation(stableID, model, stored)
+    fallbackID := c.GetEmail()
+    fallbackHash := c.hashConversation(fallbackID, model, stored)
+
+    c.convMutex.RLock()
+    defer c.convMutex.RUnlock()
+
+    // Try stable hash first
+    if key, ok := c.convIndex["hash:"+stableHash]; ok {
+        if rec, ok2 := c.convData[key]; ok2 {
+            return rec, true
+        }
+    }
+    if rec, ok := c.convData[stableHash]; ok {
+        return rec, true
+    }
+
+    // Fallback to old scheme (file-name based client id)
+    if key, ok := c.convIndex["hash:"+fallbackHash]; ok {
+        if rec, ok2 := c.convData[key]; ok2 {
+            return rec, true
+        }
+    }
+    if rec, ok := c.convData[fallbackHash]; ok {
+        return rec, true
+    }
+    return conversationRecord{}, false
+}
+
+func (c *GeminiWebClient) findConversation(model string, msgs []roleText) (conversationRecord, bool) {
+    if len(msgs) == 0 {
+        return conversationRecord{}, false
+    }
+    if rec, ok := c.findByMessageList(model, msgs); ok {
+        return rec, true
+    }
+    if rec, ok := c.findByMessageList(model, sanitizeAssistantMessages(msgs)); ok {
+        return rec, true
+    }
+    return conversationRecord{}, false
+}
+
+// Returns: reusable metadata (if found) and remaining messages (suffix to send)
+func (c *GeminiWebClient) findReusableSession(model string, msgs []roleText) ([]string, []roleText) {
+    if len(msgs) < 2 {
+        return nil, nil
+    }
+    searchEnd := len(msgs)
+    for searchEnd >= 2 {
+        sub := msgs[:searchEnd]
+        tail := sub[len(sub)-1]
+        if strings.EqualFold(tail.Role, "assistant") || strings.EqualFold(tail.Role, "system") {
+            if rec, ok := c.findConversation(model, sub); ok {
+                remain := msgs[searchEnd:]
+                return rec.Metadata, remain
+            }
+        }
+        searchEnd--
+    }
+    return nil, nil
+}
+
+func (c *GeminiWebClient) storeConversationJSON(model string, history []roleText, metadata []string, output *gemweb.ModelOutput) {
+    if output == nil || len(output.Candidates) == 0 {
+        return
+    }
+    text := ""
+    if t := output.Candidates[0].Text; t != "" {
+        text = removeThinkTags(t)
+    }
+    final := append([]roleText{}, history...)
+    final = append(final, roleText{Role: "assistant", Text: text})
+
+    rec := conversationRecord{
+        Model:     model,
+        ClientID:  c.StableClientID(),
+        Metadata:  metadata,
+        Messages:  c.toStoredMessages(final),
+        CreatedAt: time.Now(),
+        UpdatedAt: time.Now(),
+    }
+
+    clientID := rec.ClientID
+    hash := c.hashConversation(clientID, model, rec.Messages)
+
+    c.convMutex.Lock()
+    c.convData[hash] = rec
+    c.convIndex["hash:"+hash] = hash
+    // Backward-compat: also index by legacy file-name based client id
+    legacyID := c.GetEmail()
+    if legacyID != clientID {
+        fhash := c.hashConversation(legacyID, model, rec.Messages)
+        c.convIndex["hash:"+fhash] = hash
+    }
+    c.convMutex.Unlock()
+    _ = c.saveConvData()
+}
+
+func sha256Hex(s string) string {
+    sum := sha256.Sum256([]byte(s))
+    return hex.EncodeToString(sum[:])
 }
 
 func (c *GeminiWebClient) materializeInlineFiles(files [][]byte, mimes []string) ([]string, *interfaces.ErrorMessage) {
