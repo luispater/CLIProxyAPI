@@ -543,7 +543,7 @@ func (c *GeminiWebClient) convStorePath() string {
     if err != nil || wd == "" {
         wd = "."
     }
-    convDir := filepath.Join(wd, "logs", "conv")
+    convDir := filepath.Join(wd, "conv")
     base := strings.TrimSuffix(filepath.Base(c.tokenFilePath), filepath.Ext(c.tokenFilePath))
     return filepath.Join(convDir, base+".conv.json")
 }

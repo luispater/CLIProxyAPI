@@ -1,6 +1,7 @@
 config.yaml
 docs/*
 logs/*
+conv/*
 auths/*
 !auths/.gitkeep
 AGENTS.md
